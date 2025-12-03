@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Background circle -->
+  <circle cx="64" cy="64" r="60" fill="#1a1a2e" stroke="#16213e" stroke-width="4"/>
+  
+  <!-- Docker whale body -->
+  <path d="M30 58 h12 v10 h-12 z" fill="#0db7ed"/>
+  <path d="M44 58 h12 v10 h-12 z" fill="#0db7ed"/>
+  <path d="M58 58 h12 v10 h-12 z" fill="#0db7ed"/>
+  <path d="M44 46 h12 v10 h-12 z" fill="#0db7ed"/>
+  <path d="M58 46 h12 v10 h-12 z" fill="#0db7ed"/>
+  <path d="M58 34 h12 v10 h-12 z" fill="#0db7ed"/>
+  
+  <!-- Docker whale base -->
+  <path d="M24 70 Q20 70 20 74 Q20 82 32 86 L80 86 Q92 82 94 74 Q94 70 90 68 L72 68 L72 70 L24 70" fill="#0db7ed"/>
+  
+  <!-- Whale eye -->
+  <circle cx="85" cy="76" r="2" fill="#1a1a2e"/>
+  
+  <!-- PRTG-style monitoring graph -->
+  <path d="M28 100 L40 94 L52 98 L64 88 L76 92 L88 82 L100 86" 
+        stroke="#00ff88" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- Graph dots -->
+  <circle cx="28" cy="100" r="3" fill="#00ff88"/>
+  <circle cx="52" cy="98" r="3" fill="#00ff88"/>
+  <circle cx="76" cy="92" r="3" fill="#00ff88"/>
+  <circle cx="100" cy="86" r="3" fill="#00ff88"/>
+  
+  <!-- Alert indicator -->
+  <circle cx="100" cy="32" r="12" fill="#ff4757"/>
+  <text x="100" y="37" text-anchor="middle" fill="white" font-size="16" font-weight="bold" font-family="Arial">!</text>
+</svg>
