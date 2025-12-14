@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PRTG Docker Monitoring Setup Script - Script V2 Version
-Version: 11.3.1 - Fixed race condition in limit configuration
+Version: 12.1.0 - Fixed limit configuration with tag-based marker
 
 New features:
 - Cache validation for probe-id and probe-device-id
@@ -9,10 +9,27 @@ New features:
 - Docker Stats Writer sensor on probe device
 - Cleanup orphaned sensors with --cleanup-orphaned flag
 - Smart channel limits configuration (checks primary channel to avoid race condition)
+- Tag-based marker to prevent overwriting manually configured limits
 - Primary channel set to Health Status (using undocumented editsettings endpoint)
+- Comprehensive channel limits for all disk, memory, and performance metrics
+- Writer sensor limits for collection time monitoring
 
-Bug fix: Check primary channel instead of limitmode to ensure channels exist before
-         declaring configuration complete. Prevents race condition on first run.
+Channel IDs (v3.3.0+):
+- 10: Health Status
+- 11: CPU Usage
+- 12: Memory Usage
+- 13: Memory Usage %
+- 14: Network RX Rate
+- 15: Network TX Rate
+- 16: Block I/O Read
+- 17: Block I/O Write
+- 18: Disk - Container Data
+- 19: Disk - Container
+- 20: Disk - Volumes
+- 21: Disk - Total
+- 22: Log File Size
+- 23: Uptime
+- 24: Restart Count
 """
 
 import os
@@ -45,7 +62,7 @@ PASSWORD = os.getenv('PRTG_PASSWORD')
 DEVICE_NAME = "Docker Containers"
 SCRIPT_FILE = "docker_stats_reader.py"
 WRITER_SCRIPT = "docker_stats_writer.py"
-VERSION = "11.3.1"
+VERSION = "12.1.0"
 
 # Cache files
 PROBE_ID_CACHE_FILE = "/config/probe-id.txt"
@@ -301,7 +318,12 @@ class PRTGAPIv1:
         sensors = self.get_sensors(device_id)
         for sensor in sensors:
             if sensor.get('sensor') == sensor_name:
-                print(f"  ✓ Writer sensor already exists (ID: {sensor['objid']})", file=sys.stderr)
+                sensor_id = sensor['objid']
+                print(f"  ✓ Writer sensor already exists (ID: {sensor_id})", file=sys.stderr)
+                # Configure limits on existing sensor
+                if self.needs_limit_configuration(sensor_id):
+                    print(f"    Configuring limits for writer sensor...", file=sys.stderr)
+                    self.configure_writer_sensor_limits(sensor_id)
                 return True
         
         print(f"  Creating writer sensor '{sensor_name}'...", file=sys.stderr)
@@ -337,7 +359,7 @@ class PRTGAPIv1:
                 'tmpid': '10',
                 'sensortype': 'paessler.exe.exe_sensor',
                 'name_': sensor_name,
-                'tags_': 'dockersensor scriptv2',
+                'tags_': 'dockersensor scriptv2 writer',
                 'priority_': '3',
                 'paessler-exe-exe_metascan_section-exe_metascan_group-exe_name_': WRITER_SCRIPT,
                 'metascan_': '1',
@@ -361,11 +383,15 @@ class PRTGAPIv1:
             if resp.status_code in [200, 302]:
                 time.sleep(2)
                 
-                # Verify
+                # Verify and configure limits
                 sensors = self.get_sensors(device_id)
                 for sensor in sensors:
                     if sensor.get('sensor') == sensor_name:
-                        print(f"  ✓ Writer sensor created (ID: {sensor['objid']})", file=sys.stderr)
+                        sensor_id = sensor['objid']
+                        print(f"  ✓ Writer sensor created (ID: {sensor_id})", file=sys.stderr)
+                        # Configure limits on new sensor
+                        time.sleep(1)
+                        self.configure_writer_sensor_limits(sensor_id)
                         return True
                 
                 print(f"  ⚠ Writer sensor not found after creation", file=sys.stderr)
@@ -459,41 +485,137 @@ class PRTGAPIv1:
     
     def needs_limit_configuration(self, sensor_id: int) -> bool:
         """
-        Check if sensor needs limit configuration by checking the primary channel.
+        Check if sensor needs initial limit configuration.
+        Uses tag 'limits-configured' as marker to prevent re-configuration.
         
-        We check primary channel (not limitmode) because:
-        - Primary channel can only be set if channels actually exist
-        - If primary channel == 10, we know full configuration succeeded
-        - This avoids race condition where limitmode=1 but channels don't exist yet
+        This prevents the script from overwriting manually adjusted limits.
+        Once the tag is present, limits will never be reconfigured automatically.
         
         Returns True if limits not configured, False if already configured.
         """
         try:
+            # Check if sensor already has 'limits-configured' tag
             url = f"{self.host}/api/getobjectproperty.htm"
             params = {
                 'id': sensor_id,
-                'name': 'primarychannel',
+                'name': 'tags',
                 'show': 'nohtmlencode',
                 'username': self.username,
                 'passhash': self.passhash
             }
             resp = self.session.get(url, params=params, timeout=10)
-            # If primary channel is already 10 (Health Status), configuration is done
+            tags = resp.text.strip()
+            
+            # If marker tag exists, skip configuration
+            if 'limits-configured' in tags.lower():
+                return False
+            
+            # Check if primary channel is set (channels exist)
+            params['name'] = 'primarychannel'
+            params['show'] = 'nohtmlencode'
+            resp = self.session.get(url, params=params, timeout=10)
+            
+            # Need config if primary channel not yet set to 10
             return resp.text.strip() != '10'
         except:
             # If check fails, attempt configuration anyway
             return True
     
+    def configure_writer_sensor_limits(self, sensor_id: int) -> bool:
+        """
+        Configure channel limits for Docker Stats Writer sensor.
+        
+        Writer sensor channels:
+        - 10: Containers Monitored (no limit)
+        - 11: Collection Time (no limit - total can vary)
+        - 12: Avg Time per Container - Warning 80ms, Error 100ms
+        """
+        try:
+            url = f"{self.host}/api/setobjectproperty.htm"
+            base_params = {
+                'id': sensor_id,
+                'username': self.username,
+                'passhash': self.passhash
+            }
+            
+            limits = [
+                # Avg Time per Container (12) - Warning 80ms, Error 100ms
+                ('12', 'limitmaxwarning', '80'),
+                ('12', 'limitmaxerror', '100'),
+                ('12', 'limitmode', '1'),
+            ]
+            
+            for channel_id, param_name, param_value in limits:
+                params = base_params.copy()
+                params['subtype'] = 'channel'
+                params['subid'] = channel_id
+                params['name'] = param_name
+                params['value'] = param_value
+                self.session.get(url, params=params, timeout=10)
+            
+            # Set primary channel to Containers Monitored (channel 10)
+            self.set_primary_channel(sensor_id, 10)
+            
+            # Add marker tag to prevent future re-configuration
+            try:
+                # Get existing tags first - use nohtmlencode to get clean text
+                tag_url = f"{self.host}/api/getobjectproperty.htm"
+                tag_params = {
+                    'id': sensor_id,
+                    'name': 'tags',
+                    'show': 'nohtmlencode',
+                    'username': self.username,
+                    'passhash': self.passhash
+                }
+                resp = self.session.get(tag_url, params=tag_params, timeout=10)
+                existing_tags = resp.text.strip()
+                
+                # Clean up any XML artifacts if present
+                if existing_tags.startswith('<?xml') or existing_tags.startswith('<'):
+                    existing_tags = ""
+                
+                # Append marker tag to existing tags
+                if existing_tags and 'limits-configured' not in existing_tags:
+                    new_tags = f"{existing_tags} limits-configured"
+                elif not existing_tags:
+                    new_tags = "dockersensor scriptv2 writer limits-configured"
+                else:
+                    # Already has marker, skip
+                    return True
+                
+                # Set updated tags
+                set_params = base_params.copy()
+                set_params['name'] = 'tags'
+                set_params['value'] = new_tags
+                self.session.get(url, params=set_params, timeout=10)
+                
+                print(f"    ✓ Configured writer sensor limits + marker tag", file=sys.stderr)
+            except Exception as e:
+                print(f"    ✓ Configured writer sensor limits (marker tag failed: {e})", file=sys.stderr)
+            
+            return True
+            
+        except Exception as e:
+            print(f"    ⚠ Failed to configure writer limits: {e}", file=sys.stderr)
+            return False
+    
     def configure_sensor_limits(self, sensor_id: int) -> bool:
         """
         Configure sensible channel limits for Docker container sensors.
         
-        Channel limits:
+        Channel limits (v3.3.0+ channel IDs):
         - 10: Health Status - Error if 0 (unhealthy) + SET AS PRIMARY
         - 11: CPU Usage - Warning 80%, Error 95%
-        - 14: Memory Usage % - Warning 80%, Error 95%
-        - 23: Log File Size - Warning 100MB, Error 500MB
-        - 25: Restart Count - Warning 1, Error 5
+        - 13: Memory Usage % - Warning 80%, Error 95%
+        - 18: Disk - Container Data - Warning 512MB, Error 1GB
+        - 19: Disk - Container - Warning 1GB, Error 5GB
+        - 20: Disk - Volumes - Warning 1GB, Error 5GB
+        - 21: Disk - Total - Warning 2GB, Error 5GB
+        - 22: Log File Size - Warning 100MB, Error 500MB
+        - 24: Restart Count - Warning 1, Error 5
+        
+        Once configured, the 'limits-configured' tag is added to prevent
+        future automatic reconfiguration, allowing manual adjustments to persist.
         """
         try:
             url = f"{self.host}/api/setobjectproperty.htm"
@@ -514,20 +636,40 @@ class PRTGAPIv1:
                 ('11', 'limitmaxerror', '95'),
                 ('11', 'limitmode', '1'),
                 
-                # Memory Usage % (14) - Warning 80%, Error 95%
-                ('14', 'limitmaxwarning', '80'),
-                ('14', 'limitmaxerror', '95'),
-                ('14', 'limitmode', '1'),
+                # Memory Usage % (13) - Warning 80%, Error 95%
+                ('13', 'limitmaxwarning', '80'),
+                ('13', 'limitmaxerror', '95'),
+                ('13', 'limitmode', '1'),
                 
-                # Log File Size (23) - Warning 100MB, Error 500MB
-                ('23', 'limitmaxwarning', '104857600'),  # 100MB in bytes
-                ('23', 'limitmaxerror', '524288000'),    # 500MB in bytes
-                ('23', 'limitmode', '1'),
+                # Disk - Container Data (18) - Warning 512MB, Error 1GB
+                ('18', 'limitmaxwarning', '536870912'),    # 512MB in bytes
+                ('18', 'limitmaxerror', '1073741824'),     # 1GB in bytes
+                ('18', 'limitmode', '1'),
                 
-                # Restart Count (25) - Warning 1, Error 5
-                ('25', 'limitmaxwarning', '1'),
-                ('25', 'limitmaxerror', '5'),
-                ('25', 'limitmode', '1'),
+                # Disk - Container (19) - Warning 1GB, Error 5GB
+                ('19', 'limitmaxwarning', '1073741824'),   # 1GB in bytes
+                ('19', 'limitmaxerror', '5368709120'),     # 5GB in bytes
+                ('19', 'limitmode', '1'),
+                
+                # Disk - Volumes (20) - Warning 1GB, Error 5GB
+                ('20', 'limitmaxwarning', '1073741824'),   # 1GB in bytes
+                ('20', 'limitmaxerror', '5368709120'),     # 5GB in bytes
+                ('20', 'limitmode', '1'),
+                
+                # Disk - Total (21) - Warning 2GB, Error 5GB
+                ('21', 'limitmaxwarning', '2147483648'),   # 2GB in bytes
+                ('21', 'limitmaxerror', '5368709120'),     # 5GB in bytes
+                ('21', 'limitmode', '1'),
+                
+                # Log File Size (22) - Warning 100MB, Error 500MB
+                ('22', 'limitmaxwarning', '104857600'),    # 100MB in bytes
+                ('22', 'limitmaxerror', '524288000'),      # 500MB in bytes
+                ('22', 'limitmode', '1'),
+                
+                # Restart Count (24) - Warning 1, Error 5
+                ('24', 'limitmaxwarning', '1'),
+                ('24', 'limitmaxerror', '5'),
+                ('24', 'limitmode', '1'),
             ]
             
             # Apply each limit using correct subtype/subid syntax
@@ -540,10 +682,55 @@ class PRTGAPIv1:
                 self.session.get(url, params=params, timeout=10)
             
             # Set primary channel to Health Status (channel 10) using editsettings
-            if self.set_primary_channel(sensor_id, 10):
-                print(f"    ✓ Configured limits + primary channel", file=sys.stderr)
-            else:
-                print(f"    ✓ Configured limits (primary channel failed)", file=sys.stderr)
+            primary_set = self.set_primary_channel(sensor_id, 10)
+            
+            # Add marker tag to prevent future re-configuration
+            try:
+                # Get existing tags first - use nohtmlencode to get clean text
+                tag_url = f"{self.host}/api/getobjectproperty.htm"
+                tag_params = {
+                    'id': sensor_id,
+                    'name': 'tags',
+                    'show': 'nohtmlencode',
+                    'username': self.username,
+                    'passhash': self.passhash
+                }
+                resp = self.session.get(tag_url, params=tag_params, timeout=10)
+                existing_tags = resp.text.strip()
+                
+                # Clean up any XML artifacts if present
+                if existing_tags.startswith('<?xml') or existing_tags.startswith('<'):
+                    existing_tags = ""
+                
+                # Append marker tag to existing tags
+                if existing_tags and 'limits-configured' not in existing_tags:
+                    new_tags = f"{existing_tags} limits-configured"
+                elif not existing_tags:
+                    new_tags = "dockersensor scriptv2 limits-configured"
+                else:
+                    # Already has marker, skip
+                    if primary_set:
+                        print(f"    ✓ Configured limits + primary channel (marker already present)", file=sys.stderr)
+                    else:
+                        print(f"    ✓ Configured limits (marker already present, primary channel failed)", file=sys.stderr)
+                    return True
+                
+                # Set updated tags
+                set_params = base_params.copy()
+                set_params['name'] = 'tags'
+                set_params['value'] = new_tags
+                self.session.get(url, params=set_params, timeout=10)
+                
+                if primary_set:
+                    print(f"    ✓ Configured limits + primary channel + marker tag", file=sys.stderr)
+                else:
+                    print(f"    ✓ Configured limits + marker tag (primary channel failed)", file=sys.stderr)
+            except Exception as e:
+                if primary_set:
+                    print(f"    ✓ Configured limits + primary channel (marker tag failed: {e})", file=sys.stderr)
+                else:
+                    print(f"    ✓ Configured limits (primary channel & marker tag failed)", file=sys.stderr)
+            
             return True
             
         except Exception as e:
@@ -599,34 +786,26 @@ class PRTGAPIv1:
             # Using Script V2 parameters as observed in PrtgAPI
             create_url = f"{self.host}/addsensor5.htm"
             
+            # Parameters to pass to the script
+            script_params = f"--container {container_name}"
+            
             form_data = {
-                # Core parameters
                 'id': str(device_id),
                 'tmpid': '10',
                 'sensortype': 'paessler.exe.exe_sensor',
                 'name_': sensor_name,
-                
-                # Tags and priority
                 'tags_': 'dockersensor scriptv2',
                 'priority_': '3',
-                
-                # Script V2 specific parameters (EXACT match from PrtgAPI)
-                'paessler-exe-exe_metascan_section-exe_metascan_group-exe_name_': SCRIPT_FILE,  # THE KEY PARAMETER!
+                'paessler-exe-exe_metascan_section-exe_metascan_group-exe_name_': SCRIPT_FILE,
                 'metascan_': '1',
                 'metascan__check': SCRIPT_FILE,
-                'paessler-exe-exe_section-exe_group-parameters_': f'--container {container_name}',
+                'paessler-exe-exe_section-exe_group-parameters_': script_params,
                 'paessler-exe-exe_section-exe_group-timeout_': '60',
                 'writeresult_': 'DiscardResult',
-                
-                # Interval settings
                 'intervalgroup': '1',
                 'interval_': '60|60 seconds',
                 'errorintervalsdown_': '1',
-                
-                # Triggers
                 'inherittriggers': '1',
-                
-                # Authentication
                 'username': self.username,
                 'passhash': self.passhash
             }
@@ -634,88 +813,49 @@ class PRTGAPIv1:
             if csrf_token:
                 form_data['anti-csrf-token'] = csrf_token
             
-            # Debug: show what we're sending
-            print(f"    Posting sensor creation with parameters:", file=sys.stderr)
-            for key, value in form_data.items():
-                if key not in ['username', 'passhash', 'anti-csrf-token']:
-                    print(f"      {key} = {value}", file=sys.stderr)
-            
-            # Post the sensor creation
             resp = self.session.post(create_url, data=form_data, verify=False, timeout=30)
             
-            print(f"    Response status: {resp.status_code}", file=sys.stderr)
-            
             if resp.status_code in [200, 302]:
-                # Wait for sensor to be created
-                time.sleep(2)
-                
-                # Verify sensor exists
-                sensors = self.get_sensors(device_id)
-                for sensor in sensors:
-                    if sensor.get('sensor') == sensor_name:
-                        sensor_id = sensor.get('objid')
-                        
-                        # Trigger initial scan
-                        try:
-                            scan_url = f"{self.host}/api/scannow.htm"
-                            scan_params = {
-                                'id': sensor_id,
-                                'username': self.username,
-                                'passhash': self.passhash
-                            }
-                            self.session.get(scan_url, params=scan_params, timeout=10)
-                            print(f"    ✓ Sensor created (ID: {sensor_id}) - scan triggered", file=sys.stderr)
-                        except:
-                            print(f"    ✓ Sensor created (ID: {sensor_id})", file=sys.stderr)
-                        
-                        return True
-                
-                print(f"    ⚠ Sensor not found after creation", file=sys.stderr)
-                # Debug: show what sensors we found
-                print(f"    Found {len(sensors)} sensors on device", file=sys.stderr)
-                return False
+                return True
             else:
-                print(f"    ✗ POST failed with status {resp.status_code}", file=sys.stderr)
-                # Debug: print response excerpt
-                response_excerpt = resp.text[:1000] if len(resp.text) > 1000 else resp.text
-                print(f"    Response excerpt: {response_excerpt}", file=sys.stderr)
+                print(f"    ✗ Sensor creation returned status {resp.status_code}", file=sys.stderr)
                 return False
-            
+                
         except Exception as e:
             print(f"    ✗ Error creating sensor: {e}", file=sys.stderr)
-            import traceback
-            print(f"    Traceback: {traceback.format_exc()}", file=sys.stderr)
             return False
 
 
 def prtg_error(message: str):
-    """Output PRTG-formatted error and exit."""
-    print(json.dumps({"version": 2, "status": "error", "message": message}, indent=2))
+    """Output error in PRTG format and exit."""
+    print(json.dumps({
+        "version": 2,
+        "status": "error",
+        "message": message
+    }, indent=2))
     sys.exit(1)
 
 
-def get_active_containers() -> List:
-    """Get list of active Docker containers."""
+def get_active_containers():
+    """Get list of active containers from Docker."""
     try:
         client = docker.from_env()
         containers = client.containers.list(filters={"status": "running"})
-        print(f"✓ Found {len(containers)} active containers", file=sys.stderr)
         return containers
     except Exception as e:
-        prtg_error(f"Failed to connect to Docker: {e}")
+        print(f"Error getting containers: {e}", file=sys.stderr)
+        return []
 
 
 def main():
-    """Main execution function."""
-    # Parse arguments
-    parser = argparse.ArgumentParser(description='PRTG Docker Monitoring Setup')
-    parser.add_argument('--cleanup-orphaned', action='store_true',
-                        help='Delete sensors for stopped containers')
+    parser = argparse.ArgumentParser(description='Setup Docker monitoring in PRTG')
+    parser.add_argument('--cleanup-orphaned', action='store_true', 
+                       help='Delete sensors for containers that no longer exist')
     args = parser.parse_args()
     
     print("=" * 70, file=sys.stderr)
     print("DOCKER MONITORING SETUP (Script V2 Version)", file=sys.stderr)
-    print(f"Version: {VERSION} - Fixed race condition + Primary channel", file=sys.stderr)
+    print(f"Version: {VERSION} - Tag-based limit configuration", file=sys.stderr)
     print("=" * 70, file=sys.stderr)
     
     # Validate environment
